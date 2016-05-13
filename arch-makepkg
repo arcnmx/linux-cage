@@ -1,0 +1,34 @@
+#!/bin/bash
+set -eu
+
+PACKAGE="$1"
+OUT="$2"
+shift 2
+
+DIR="$(mktemp -d)"
+_cleanup() {
+	rm -rf "$DIR"
+}
+trap _cleanup EXIT
+
+cd "$DIR"
+
+(
+	cat /etc/makepkg.conf
+	echo "
+		DLAGENTS+=('file::/usr/bin/curl -fLC - -o %o %u')
+	"
+) > _makepkg.conf
+
+cp -a "$PACKAGE/"* ./
+env EUID=1 makepkg -sc --noconfirm --config _makepkg.conf "$@"
+
+for pkg in $(env EUID=1 makepkg --packagelist --config _makepkg.conf); do
+	pkgfile=$pkg.pkg*
+	if [ ! -f $pkgfile ]; then
+		echo "Unable to find $pkg" >&2
+		exit 1
+	fi
+
+	cp $pkgfile "$OUT"
+done

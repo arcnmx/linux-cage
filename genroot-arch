@@ -1,0 +1,63 @@
+#!/bin/bash
+set -eu
+
+ARCH_MIRRORS="https://www.archlinux.org/mirrorlist/?country=all&protocol=https&ip_version=4&ip_version=6&use_mirror_status=on"
+ARCH_VERSION=2016.05.01
+ARCH_ARCH=x86_64
+ARCH_BASE=(bash bzip2 coreutils diffutils file filesystem findutils gawk gcc-libs glibc grep gzip inetutils iproute2 iputils less logrotate netctl perl procps-ng psmisc s-nail sed shadow tar util-linux which)
+ARCH_BASE_DEVEL=(autoconf automake binutils bison fakeroot flex gcc gettext groff gzip libtool m4 make patch pkg-config sed texinfo pacman git)
+
+FLAG_PACKAGES=("${ARCH_BASE[@]}")
+FLAG_DEV=
+FLAG_BOOTSTRAP=
+while getopts ":p:d" opt; do
+	case $opt in
+		p) # --packages "openssh git"
+			FLAG_PACKAGES+=($OPTARG)
+			;;
+		d) # --base-devel
+			FLAG_PACKAGES+=("${ARCH_BASE_DEVEL[@]}")
+			FLAG_DEV=y
+			;;
+		b) # --bootstrap ./arch-bootstrap
+			FLAG_BOOTSTRAP="$OPTARG"
+			;;
+		\?)
+			echo "Invalid option: -$OPTARG" >&2
+			exit 1
+			;;
+	esac
+done
+shift $((OPTIND-1))
+
+if [ -z "$FLAG_BOOTSTRAP" ]; then
+	FLAG_BOOTSTRAP=$(mktemp -d --tmpdir arch-bootstrap.XXXXXXXX)
+	_bootstrap_cleanup() {
+		find "$FLAG_BOOTSTRAP" -type d -exec chmod +w {} + > /dev/null 2>&1 || true
+		rm -rf "$FLAG_BOOTSTRAP"
+	}
+	trap _bootstrap_cleanup EXIT
+fi
+
+FLAG_OUT="$1"
+shift
+
+if [ -z "${ARCH_MIRROR-}" ]; then
+	ARCH_MIRROR=$(curl -sSL "$ARCH_MIRRORS" | perl -pe 's/^#Server = //' | grep '^http' | shuf -n 1)
+fi
+ARCH_MIRROR_BASE=$(echo "$ARCH_MIRROR" | rev | cut -d / -f 4- | rev)
+ARCH_BOOTSTRAP="$ARCH_MIRROR_BASE/iso/$ARCH_VERSION/archlinux-bootstrap-$ARCH_VERSION-$ARCH_ARCH.tar.gz"
+
+mkdir -p "$FLAG_BOOTSTRAP"
+curl -sSL "$ARCH_BOOTSTRAP" | tar -xz --strip-components 1 -C "$FLAG_BOOTSTRAP"
+cage exec -2 "$FLAG_BOOTSTRAP" pacman-key --init
+cage exec -2 "$FLAG_BOOTSTRAP" pacman-key --populate archlinux
+
+echo "Server = $ARCH_MIRROR" > "$FLAG_BOOTSTRAP/etc/pacman.d/mirrorlist"
+
+mkdir -p "$FLAG_OUT"
+cage exec -2b "$FLAG_OUT:/mnt/out" -e http_proxy "$FLAG_BOOTSTRAP" pacstrap -dc /mnt/out "${FLAG_PACKAGES[@]}" --noprogressbar
+
+if [ -n "$FLAG_DEV" ]; then
+	echo "PKGEXT=.pkg.tar" >> "$FLAG_OUT/etc/makepkg.conf"
+fi

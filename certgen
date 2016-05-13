@@ -1,0 +1,212 @@
+#!/bin/bash
+set -eu
+
+usage() {
+	echo "Usage: $0 [OPTIONS...] OUT_DIR [CA_DIR]"
+	echo " -t CERT_TYPE: root, int, client, server"
+	echo " -s SUBJECT"
+	echo " [-a ALT_NAMES]: for example 'DNS:some.domain,DNS:other.domain'"
+	echo " [-d EXPIRY_DAYS]: defaults to 1024"
+	echo " CA_DIR: optional if CERT_TYPE is root (self-signed)"
+	echo
+	echo "Outputs"
+	echo "OUT_DIR/cert.pem: generated certificate"
+	echo "OUT_DIR/cert.key: generated private key"
+	echo "OUT_DIR/chain.pem: generated certificate and the full chain"
+}
+
+main() {
+	EXPIRY_DAYS=1024
+	ALT_NAMES=
+	while getopts ":ht:c:d:a:" opt; do
+		case $opt in
+			h) # --help
+				usage
+				return 0
+				;;
+			t) # --cert-type (root|int|client|server)
+				CERT_TYPE="$OPTARG"
+				;;
+			s) # --subject /C=CA/ST=Ontario/L=Toronto/O=org/OU=unit/CN=commonname
+				SUBJECT="$OPTARG"
+				;;
+			a) # --alt-names DNS:some.domain
+				ALT_NAMES="$OPTARG"
+				;;
+			d) # --expiry-days 1024
+				EXPIRY_DAYS="$OPTARG"
+				;;
+			:)
+				echo "Expected value for -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+			\?)
+				echo "Invalid option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+
+	if [ -z "${CERT_TYPE-}" -o -z "${SUBJECT-}" ]; then
+		echo "Missing required options" >&2
+		usage >&2
+		return 1
+	fi
+
+	if [ $# -lt 1 ]; then
+		usage >&2
+		return 1
+	fi
+	OUT_DIR="$1"
+	shift
+
+	if [ "$CERT_TYPE" != "root" ]; then
+		if [ $# -lt 1 ]; then
+			usage >&2
+			return 1
+		fi
+
+		CA_DIR="$1"
+		shift
+	else
+		CA_DIR="$OUT_DIR"
+	fi
+
+	if [ ! -e "$CA_DIR/index.txt" ]; then
+		setupcert "$CA_DIR"
+	fi
+
+	gencert "$CA_DIR" "$OUT_DIR" "$CERT_TYPE" "$SUBJECT" "$ALT_NAMES" "$EXPIRY_DAYS"
+}
+
+setupcert() {
+	local DIR="$1"
+
+	if [ -e "$DIR/index.txt" ]; then
+		echo "cert already recording" >&2
+		return 1
+	fi
+	mkdir -p "$DIR/certs" "$DIR/crl"
+	touch "$DIR/index.txt"
+	echo 0001 > "$DIR/serial.txt"
+}
+
+gencert() {
+	local CERTDIR="$1"
+	local OUTDIR="$2"
+	local TYPE="$3"
+	local SUBJECT="$4"
+	local ALT_NAMES="$5"
+	local EXPIRY_DAYS="$6"
+
+	local RSA_BITS=4096
+	local SELFSIGN=
+	local V3_NAME=
+	local LOCATION_POLICY="optional"
+	case "$TYPE" in
+		root)
+			if [ "$CERTDIR" != "$OUTDIR" ]; then
+				echo "CERTDIR and OUTDIR must be the same for a self-signed CA" >&2
+				return 1
+			fi
+			SELFSIGN="-selfsign"
+			V3_NAME="v3_root"
+			LOCATION_POLICY="match"
+			;;
+		int)
+			V3_NAME="v3_int"
+			;;
+		client)
+			RSA_BITS=2048
+			V3_NAME="v3_client"
+			;;
+		server)
+			RSA_BITS=2048
+			V3_NAME="v3_server"
+			;;
+		*)
+			echo "Unrecognized output cert type" >&2
+			usage >&2
+			return 1
+			;;
+	esac
+
+	mkdir -p "$OUTDIR"
+	openssl genrsa -out "$OUTDIR/cert.key" "$RSA_BITS"
+	openssl req -config <(echo "
+[req]
+distinguished_name = req_distinguished_name
+[req_distinguished_name]
+	") \
+		-new -sha256 -utf8 -key "$OUTDIR/cert.key" \
+		-subj "$SUBJECT" |
+	openssl ca -config <(echo "
+[ca]
+database = $CERTDIR/index.txt
+serial = $CERTDIR/serial.txt
+crl_dir = $CERTDIR/crl
+new_certs_dir = $CERTDIR/certs
+RANDFILE = $CERTDIR/.rand
+
+[crl]
+authorityKeyIdentifier = keyid:always
+
+[v3_root]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical, CA:true
+keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+
+[v3_int]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always,issuer
+basicConstraints = critical, CA:true, pathlen:0
+keyUsage = critical, digitalSignature, cRLSign, keyCertSign
+
+[v3_client]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer
+basicConstraints = CA:false
+keyUsage = critical, nonRepudiation, digitalSignature, keyEncipherment
+extendedKeyUsage = clientAuth, emailProtection
+nsCertType = client, email
+$([ -n "$ALT_NAMES" ] && echo "subjectAltName = $ALT_NAMES" || true)
+# nsComment =
+
+[v3_server]
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid,issuer:always
+basicConstraints = CA:false
+keyUsage = critical, digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
+nsCertType = server
+$([ -n "$ALT_NAMES" ] && echo "subjectAltName = $ALT_NAMES" || true)
+# nsComment =
+
+[policy]
+countryName             = $LOCATION_POLICY
+stateOrProvinceName     = $LOCATION_POLICY
+organizationName        = $LOCATION_POLICY
+organizationalUnitName  = optional
+commonName              = supplied
+emailAddress            = optional
+") \
+		-name ca -extensions "$V3_NAME" -crlexts crl -policy policy \
+		-utf8 -batch -notext \
+		-keyfile "$CA_DIR/cert.key" -cert "$CA_DIR/cert.pem" $SELFSIGN \
+		-days "$EXPIRY_DAYS" -md sha256 \
+		-in /dev/stdin -out "$OUTDIR/cert.pem"
+
+	if [ "$TYPE" = root ]; then
+		cp "$OUTDIR/cert.pem" "$OUTDIR/chain.pem"
+	elif [ "$TYPE" = int ]; then
+		cat "$OUTDIR/cert.pem" "$CERTDIR/chain.pem" > "$OUTDIR/chain.pem"
+	else
+		cp "$CERTDIR/chain.pem" "$OUTDIR/chain.pem"
+	fi
+}
+
+main "$@"

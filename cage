@@ -1,0 +1,303 @@
+#!/bin/bash
+set -eu
+
+usage() {
+	echo "Usage: $0 [OPTIONS...] SUBCOMMAND [ARGS...]"
+	echo " [-h]: show this help"
+	echo
+	echo "Subcommands"
+	echo "exec [OPTIONS...] ROOT_PATH,root_options EXEC_PATH ARGS..."
+	echo " Executes a process inside an isolated container."
+	echo " [-h]: show this help"
+	echo " [-E engine]: specify the container engine to use"
+	echo " [-b local/path:/mnt/container/path,options]: bind mount a path in the container"
+	echo " [-e KEY=value]: set an environment variable in the container"
+	echo " [-e KEY]: ommitting the value sources the variable from the enclosing environment"
+	echo " [-p path/to/pid_file]: write the container's PID to this file"
+	echo " [-2]: run the process as PID 2 using a stub init process"
+	echo " [-1]: run the process as PID 1 (init)"
+	echo
+	echo "Path and bind options"
+	echo "ro: readonly"
+	echo
+	echo "Environment"
+	echo "CAGE_ENGINE: specify the container engine to use"
+	echo
+	echo "Engines"
+	echo "nspawn: systemd-nspawn, requires root and systemd"
+	echo "unshare: included in util-linux"
+	echo "encage: https://github.com/arcnmx/encage-runtime"
+}
+
+main() {
+	while getopts ":h" opt; do
+		case $opt in
+			h) # --help
+				usage
+				return 0
+				;;
+			:)
+				echo "Expected argument for option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+			\?)
+				echo "Invalid option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+
+	if [ $# -lt 1 ]; then
+		echo "Subcommand required" >&2
+		usage >&2
+		return 1
+	fi
+
+	local SUBCOMMAND="$1"
+	shift
+
+	"cmd-$SUBCOMMAND" "$@"
+}
+
+cmd-exec() {
+	FLAG_ENGINE=${CAGE_ENGINE-}
+	FLAG_BINDS=()
+	FLAG_ENV=()
+	FLAG_PID=
+	FLAG_PIDFILE=
+	while getopts ":E:b:e:p:21h" opt; do
+		case $opt in
+			h) # --help
+				usage
+				return 0
+				;;
+			b) # --bind src:/mnt/dest
+				FLAG_BINDS+=("$OPTARG")
+				;;
+			e) # --env name=value
+				if [[ ! $OPTARG == *=* ]]; then
+					if printenv "$OPTARG" > /dev/null; then
+						OPTARG="$OPTARG=$(printenv "$OPTARG")"
+					else
+						continue
+					fi
+				fi
+				FLAG_ENV+=("$OPTARG")
+				;;
+			E) # --engine unshare
+				FLAG_ENGINE="$OPTARG"
+				;;
+			2)
+				FLAG_PID=2
+				;;
+			1)
+				FLAG_PID=1
+				;;
+			p) # --pidfile=/var/run/pid
+				FLAG_PIDFILE="$OPTARG"
+				;;
+			:)
+				echo "Expected argument for option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+			\?)
+				echo "Invalid option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+
+	if [ $# -lt 1 ]; then
+		echo "root path required" >&2
+		usage >&2
+		return 1
+	fi
+
+	FLAG_ROOT="$1"
+	shift
+
+	ARGS=("$@")
+
+	if [ -z "$FLAG_ENGINE" ]; then
+		if which systemd-nspawn >/dev/null 2>&1; then
+			FLAG_ENGINE=nspawn
+		elif which unshare >/dev/null 2>&1; then
+			FLAG_ENGINE=unshare
+		elif which encage-run >/dev/null 2>&1; then
+			FLAG_ENGINE=encage
+		else
+			echo "Unable to autodetect container engine" >&2
+			return 1
+		fi
+	fi
+
+	"cmd-engine-$FLAG_ENGINE"
+}
+
+cmd-engine-nspawn() {
+	FLAGS=(--register false -D "$FLAG_ROOT")
+	if [ "$FLAG_PID" != 1 ]; then
+		FLAGS+=(--as-pid2)
+	fi
+
+	if [ "${#FLAG_BINDS[@]}" -gt 0 ]; then
+		for mount in "${FLAG_BINDS[@]}"; do
+			if [[ ! $mount == /* ]]; then
+				mount="$PWD/$mount"
+			fi
+			FLAGS+=(--bind "$mount")
+		done
+	fi
+
+	if [ "${#FLAG_ENV[@]}" -gt 0 ]; then
+		for env in "${FLAG_ENV[@]}"; do
+			FLAGS+=(--setenv "$env")
+		done
+	fi
+
+	if [ ! -e "$FLAG_ROOT/usr/" ]; then
+		mkdir "$FLAG_ROOT/usr"
+	fi
+
+	exec systemd-nspawn "${FLAGS[@]}" "${ARGS[@]}"
+}
+
+cmd-engine-encage() {
+	local FLAGS=(--direct)
+
+	if [ "$(id -u)" != 0 ]; then
+		FLAGS+=(--user --setgroups-deny)
+	fi
+
+	if [ "$FLAG_PID" = 2 ]; then
+		FLAGS+=(-2)
+	fi
+
+	if [ "${#FLAG_BINDS[@]}" -gt 0 ]; then
+		for mount in "${FLAG_BINDS[@]}"; do
+			FLAGS+=(--bind "$mount")
+		done
+	fi
+
+	if [ "${#FLAG_ENV[@]}" -gt 0 ]; then
+		for env in "${FLAG_ENV[@]}"; do
+			FLAGS+=(--env "$env")
+		done
+	fi
+
+	exec encage-run exec "${FLAGS[@]:+${FLAGS[@]}}" -- "$FLAG_ROOT" "${ARGS[@]:+${ARGS[@]}}"
+}
+
+cmd-engine-unshare() {
+	local UNSHARE_ARGS="-imu"
+
+	# Attempt to run in a user namespace if we're not root
+	if [ "$(id -u)" != 0 ]; then
+		UNSHARE_ARGS="${UNSHARE_ARGS}Ur"
+		if [ -z "$FLAG_PID" ]; then
+			FLAG_PID=2
+		fi
+	fi
+
+	# Old versions such as those found in Ubuntu 12.04 don't support PID namespaces...
+	if [ -n "$FLAG_PID" ]; then
+		UNSHARE_ARGS="${UNSHARE_ARGS}pf"
+	fi
+
+	FLAGS=()
+	if [ "${#FLAG_BINDS[@]}" -gt 0 ]; then
+		for mount in "${FLAG_BINDS[@]}"; do
+			FLAGS+=(-b "$mount")
+		done
+	fi
+	if [ "${#FLAG_ENV[@]}" -gt 0 ]; then
+		for env in "${FLAG_ENV[@]}"; do
+			FLAGS+=(-e "$env")
+		done
+	fi
+	if [ "$FLAG_PID" = 2 ]; then
+		if ! which dumb-init >/dev/null 2>&1; then
+			DUMB_INIT=$(mktemp -d --tmpdir dumb-init.XXXXXXXXXX)
+			curl -sSLo "$DUMB_INIT/dumb-init" https://github.com/Yelp/dumb-init/releases/download/v1.0.1/dumb-init_1.0.1_amd64
+			chmod +x "$DUMB_INIT/dumb-init"
+			export PATH="$DUMB_INIT:$PATH"
+			#echo "PID 2 unimplemented, install dumb-init" >&2
+			#return 1
+		fi
+		exec unshare $UNSHARE_ARGS -- dumb-init "$SELF" internal-unshare "${FLAGS[@]:+${FLAGS[@]}}" "$FLAG_ROOT" "${ARGS[@]:+${ARGS[@]}}"
+	else
+		exec unshare $UNSHARE_ARGS -- "$SELF" internal-unshare "${FLAGS[@]:+${FLAGS[@]}}" "$FLAG_ROOT" "${ARGS[@]:+${ARGS[@]}}"
+	fi
+}
+
+cmd-internal-unshare() {
+	FLAG_BINDS=()
+	while getopts ":b:e:" opt; do
+		case $opt in
+			b)
+				FLAG_BINDS+=("$OPTARG")
+				;;
+			e)
+				FLAG_ENV+=("$OPTARG")
+				;;
+			\?)
+				return 1
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+
+	FLAG_ROOT="$1"
+	shift
+
+	mkdir -p "$FLAG_ROOT"/{mnt,proc,sys,dev,tmp}
+	mount -t proc proc "$FLAG_ROOT/proc" 2>/dev/null || mount --rbind /proc "$FLAG_ROOT/proc"
+	mount -t sysfs sys "$FLAG_ROOT/sys" 2>/dev/null || true
+	mount -t tmpfs tmp "$FLAG_ROOT/tmp"
+	mount -t tmpfs dev "$FLAG_ROOT/dev"
+	mkdir -p "$FLAG_ROOT/dev/"{pts,shm,mqueue}
+	mount -t tmpfs shm "$FLAG_ROOT/dev/shm"
+	mount -t tmpfs mqueue "$FLAG_ROOT/dev/mqueue"
+	mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$FLAG_ROOT/dev/pts"
+
+	DEVS=(
+		"/dev/null c 1 3"
+		"/dev/zero c 1 5"
+		"/dev/full c 1 7"
+		"/dev/random c 1 8"
+		"/dev/urandom c 1 9"
+		"/dev/tty c 5 0"
+	)
+	for dev in "${DEVS[@]}"; do
+		dev=($dev)
+		if ! mknod "$FLAG_ROOT/${dev[0]}" ${dev[1]} ${dev[2]} ${dev[3]} 2>/dev/null; then
+			touch "$FLAG_ROOT${dev[0]}"
+			mount --bind "${dev[0]}" "$FLAG_ROOT${dev[0]}"
+		fi
+	done
+
+	if [ "${#FLAG_BINDS[@]}" -gt 0 ]; then
+		for mount in "${FLAG_BINDS[@]}"; do
+			mount_src=`echo "$mount" | cut -d : -f 1`
+			mount_dst=`echo "$mount" | cut -d : -f 2-`
+			mkdir -p "$FLAG_ROOT/$mount_dst"
+			mount --bind "$mount_src" "$FLAG_ROOT/$mount_dst"
+		done
+	fi
+
+	exec env -i PATH=/bin:/sbin:/usr/bin:/usr/sbin "${FLAG_ENV[@]:+${FLAG_ENV[@]}}" chroot "$FLAG_ROOT" "$@"
+}
+
+SELF="$0"
+if [ ! -e "$SELF" ]; then
+	echo "Script must be called with a reachable path" >&2
+	exit 1
+fi
+
+main "$@"

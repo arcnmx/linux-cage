@@ -1,0 +1,42 @@
+#!/bin/bash
+
+BUILDENV_PROXY_PORT=${BUILDENV_PROXY_PORT-1345}
+if [ -z "${BUILDENV_PROXY_CACHE-}" ]; then
+	echo "BUILDENV_PROXY_CACHE undefined" >&2
+	return 1
+fi
+
+BUILDENV_ROOT=path/to/self
+
+trap _buildenv_cleanup EXIT
+_buildenv_cleanup() {
+	if [ -n "${POLIPO_PID-}" ]; then
+		kill $POLIPO_PID || true
+	fi
+
+	if [ -n "${RNGD_PID-}" ]; then
+		kill $RNGD_PID || true
+	fi
+}
+
+export PATH="$BUILDENV_ROOT:$PATH"
+
+if which polipo >/dev/null 2>&1; then
+	mkdir -p "$BUILDENV_PROXY_CACHE"
+	polipo -- \
+		proxyPort="$BUILDENV_PROXY_PORT" \
+		diskCacheRoot="$BUILDENV_PROXY_CACHE" diskCacheFilePermissions=0666 diskCacheDirectoryPermissions=0777 \
+		&
+	POLIPO_PID=$!
+
+	export http_proxy=localhost:$BUILDENV_PROXY_PORT
+	export ARCH_MIRROR='http://mirrors.kernel.org/archlinux/$repo/os/$arch'
+	export ALPINE_MIRROR='http://dl-4.alpinelinux.org/alpine'
+fi
+
+if which rngd >/dev/null 2>&1; then
+	rngd -qf &
+	RNGD_PID=$!
+fi
+
+# TODO: haveged?

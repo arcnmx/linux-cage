@@ -1,0 +1,171 @@
+#!/bin/sh
+set -eu
+
+usage() {
+	echo "Usage: $0 [OPTIONS...] SUBCOMMAND"
+	echo " [-h]: show this help"
+	echo " [-o ONCE_PATH]: use this file as a guard flag to only run once"
+	echo
+	echo "Subcommands"
+	echo "bootstrap POST_SCRIPT"
+	echo " Nukes the current root filesystem and executes POST_SCRIPT in a minimal busybox userspace."
+}
+
+main() {
+	if [ "$(id -u)" != 0 ]; then
+		echo "Must be run as root" >&2
+		return 1
+	fi
+
+	while getopts ":o:h" opt; do
+		case $opt in
+			h) # --help
+				usage
+				return 0
+				;;
+			o) # --once PATH
+				export ONCE_FILE="$OPTARG"
+				;;
+			:)
+				echo "Option expected argument: -$OPTARG" >&2
+				return 1
+				;;
+			\?)
+				echo "Invalid option: -$OPTARG" >&2
+				return 1
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+
+	if [ $# -lt 1 ]; then
+		echo "Subcommand required" >&2
+		usage >&2
+		return 1
+	fi
+
+	local SUBCOMMAND="$1"
+	shift
+
+	if [ -n "${ONCE_FILE-}" ] && [ -e "$ONCE_FILE" ]; then
+		echo "Already run once" >&2
+		exit 0
+	fi
+
+	"cmd_$SUBCOMMAND" "$@"
+}
+
+cmd_bootstrap() {
+	if [ $# -lt 1 ]; then
+		usage >&2
+		return 1
+	fi
+	local POST_SCRIPT="$1"
+	shift
+
+	WORKDIR="$(mktemp -d)"
+	mkdir -p "$WORKDIR"
+	mount -t tmpfs tmpfs "$WORKDIR"
+
+	mkdir -p "$WORKDIR/bin"
+
+	if [ "$(uname -m)" = "x86_64" ]; then
+		BUSYBOX_ARCH="x86_64"
+	else
+		BUSYBOX_ARCH="i686"
+	fi
+
+	mkdir -p "$WORKDIR/bin"
+
+	echo "Downloading busybox" >&2
+	download "http://busybox.net/downloads/binaries/busybox-$BUSYBOX_ARCH" > "$WORKDIR/bin/busybox"
+	chmod +x "$WORKDIR/bin/busybox"
+	"$WORKDIR/bin/busybox" --install "$WORKDIR/bin/"
+	export PATH="$WORKDIR/bin"
+
+	mkdir -p "$WORKDIR/mnt/root"
+
+	cat "$POST_SCRIPT" > "$WORKDIR/tmp/hook-post"
+	chmod +x "$WORKDIR/tmp/hook-post"
+
+	prepare_root "$WORKDIR/"
+	cp "$SELF" "$WORKDIR/tmp/self.sh"
+
+	echo "Entering chroot" >&2
+	cd "$WORKDIR"
+	pivot_root . mnt/root
+	PATH=/bin exec chroot . /bin/sh /tmp/self.sh inner /mnt/root # < dev/null > dev/console 2>&1
+}
+
+cmd_inner() {
+	local ROOT="$1"
+	shift
+
+	echo "Unmounting filesystems" >&2
+	cat /proc/self/mounts | cut -d' ' -f 2 | sort -r | grep "^$ROOT" | while read -r mount; do
+		if [ "$mount" = "$ROOT" ]; then
+			continue
+		fi
+		umount -rl "$mount"
+	done
+
+	for f in "$ROOT/"* "$ROOT/".[!.]*; do
+		if [ -e "$f" ]; then
+			rm -rf "$f"
+		fi
+	done
+
+	echo "Done! Running post hook" >&2
+
+	/tmp/hook-post "$ROOT"
+
+	if [ -n "${ONCE_FILE-}" ]; then
+		touch "/mnt/root/$ONCE_FILE"
+	fi
+}
+
+prepare_root() {
+	local ROOT="$1"
+
+	mkdir -p "$ROOT/proc" "$ROOT/dev" "$ROOT/sys" "$ROOT/tmp"
+	mount -t proc proc "$ROOT/proc" || mount --rbind /proc "$ROOT/proc"
+	mount -t tmpfs dev "$ROOT/dev"
+	mount -t sysfs sys "$ROOT/sys" || true
+
+	mkdir -p "$ROOT/dev/pts" "$ROOT/dev/shm" "$ROOT/dev/mqueue"
+	mount -t tmpfs shm "$ROOT/dev/shm"
+	mount -t tmpfs mqueue "$ROOT/dev/mqueue"
+	#mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$ROOT/dev/pts"
+
+	echo "/dev/null c 1 3
+/dev/zero c 1 5
+/dev/full c 1 7
+/dev/random c 1 8
+/dev/urandom c 1 9
+/dev/tty c 5 0" | while read -r dev; do
+		if ! mknod "$ROOT"/$dev 2>/dev/null; then
+			local devname="$(echo $dev | cut -d' ' -f1)"
+			touch "$ROOT$devname"
+			mount --bind "$devname" "$ROOT$devname"
+		fi
+	done
+	#cp "/dev/console" "$ROOT/console" || true
+}
+
+download() {
+	local URL="$1"
+
+	if which curl > /dev/null 2>&1; then
+		curl --insecure -LSsf "$URL"
+	else
+		wget -qO - "$URL"
+	fi
+}
+
+SELF="$0"
+if [ ! -e "$SELF" ]; then
+	echo "Script must be called with a reachable path" >&2
+	exit 1
+fi
+
+main "$@"
