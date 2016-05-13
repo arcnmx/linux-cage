@@ -28,10 +28,12 @@ main() {
 				;;
 			:)
 				echo "Option expected argument: -$OPTARG" >&2
+				usage >&2
 				return 1
 				;;
 			\?)
 				echo "Invalid option: -$OPTARG" >&2
+				usage >&2
 				return 1
 				;;
 		esac
