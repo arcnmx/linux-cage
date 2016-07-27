@@ -21,7 +21,7 @@ shift
 ALPINE_MIRRORS=http://nl.alpinelinux.org/alpine/MIRRORS.txt
 
 if [ -z "${ALPINE_MIRROR-}" ]; then
-	ALPINE_MIRROR=$(curl -sSL "$ALPINE_MIRRORS" | shuf -n 1)
+	ALPINE_MIRROR=$(curl -fsSL "$ALPINE_MIRRORS" | shuf -n 1)
 fi
 ALPINE_ARCH=x86_64
 ALPINE_VERSION=v3.3
@@ -29,7 +29,7 @@ APK_TOOLS_VERSION=2.6.5-r1
 APK_TOOLS_STATIC="$ALPINE_MIRROR/$ALPINE_VERSION/main/$ALPINE_ARCH/apk-tools-static-$APK_TOOLS_VERSION.apk"
 
 mkdir -p "$FLAG_OUT"
-curl -sSL "$APK_TOOLS_STATIC" | tar xz -C "$FLAG_OUT/" sbin/apk.static
+curl -fsSL "$APK_TOOLS_STATIC" | tar xz -C "$FLAG_OUT/" sbin/apk.static
 
 CAGE=(cage exec -e http_proxy -e https_proxy)
 APK_FLAGS=("$FLAG_OUT" /sbin/apk.static
