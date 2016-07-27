@@ -125,7 +125,7 @@ cmd-exec() {
 	ARGS=("$@")
 
 	if [ -z "$FLAG_ENGINE" ]; then
-		if which systemd-nspawn >/dev/null 2>&1; then
+		if [ "$(id -u)" = 0 ] && which systemd-nspawn >/dev/null 2>&1; then
 			FLAG_ENGINE=nspawn
 		elif which unshare >/dev/null 2>&1; then
 			FLAG_ENGINE=unshare
@@ -141,7 +141,7 @@ cmd-exec() {
 }
 
 cmd-engine-nspawn() {
-	FLAGS=(--register false -D "$FLAG_ROOT")
+	FLAGS=(--link-journal=no --register false -D "$FLAG_ROOT")
 	if [ "$FLAG_PID" != 1 ]; then
 		FLAGS+=(--as-pid2)
 	fi
