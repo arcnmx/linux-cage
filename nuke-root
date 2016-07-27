@@ -4,10 +4,12 @@ set -eu
 usage() {
 	echo "Usage: $0 [OPTIONS...] SUBCOMMAND"
 	echo " [-h]: show this help"
+	echo " [-l HOST:PORT]: remote syslog"
 	echo " [-o ONCE_PATH]: use this file as a guard flag to only run once"
 	echo
 	echo "Subcommands"
-	echo "bootstrap POST_SCRIPT"
+	echo "bootstrap POST_SCRIPT [ARGS...]"
+	echo " [-p PRE_SCRIPT]: run prior to nuke to prepare the busybox filesystem"
 	echo " Nukes the current root filesystem and executes POST_SCRIPT in a minimal busybox userspace."
 }
 
@@ -17,7 +19,7 @@ main() {
 		return 1
 	fi
 
-	while getopts ":o:h" opt; do
+	while getopts ":o:l:h" opt; do
 		case $opt in
 			h) # --help
 				usage
@@ -25,6 +27,9 @@ main() {
 				;;
 			o) # --once PATH
 				export ONCE_FILE="$OPTARG"
+				;;
+			l) # --log HOST:PORT
+				export SYSLOG_REMOTE="$OPTARG"
 				;;
 			:)
 				echo "Option expected argument: -$OPTARG" >&2
@@ -58,34 +63,76 @@ main() {
 }
 
 cmd_bootstrap() {
+	while getopts ":p:h" opt; do
+		case $opt in
+			h) # --help
+				usage
+				return 0
+				;;
+			p) # --pre SCRIPT
+				export PRE_SCRIPT="$OPTARG"
+				;;
+			:)
+				echo "Option expected argument: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+			\?)
+				echo "Invalid option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+		esac
+	done
+
+	shift $((OPTIND-1))
 	if [ $# -lt 1 ]; then
 		usage >&2
 		return 1
 	fi
+
 	local POST_SCRIPT="$1"
 	shift
+
+	SYSTEMCTL="$(systemctl status > /dev/null 2>&1 && which systemctl || true)"
 
 	WORKDIR="$(mktemp -d)"
 	mkdir -p "$WORKDIR"
 	mount -t tmpfs tmpfs "$WORKDIR"
 
-	mkdir -p "$WORKDIR/bin"
+	mkdir -p "$WORKDIR/bin" "$WORKDIR/tmp" "$WORKDIR/mnt"
 
-	if [ "$(uname -m)" = "x86_64" ]; then
-		BUSYBOX_ARCH="x86_64"
+	if [ -n "${NUKE_SYSTEM_BUSYBOX-}" ] && which busybox > /dev/null 2>&1; then
+		echo "Using system busybox" >&2
+		cp "$(which busybox)" "$WORKDIR/bin/busybox"
 	else
-		BUSYBOX_ARCH="i686"
+		echo "Downloading busybox" >&2
+
+		BUSYBOX_VERSION="1.25.0"
+		if [ "$(uname -m)" = "x86_64" ]; then
+			BUSYBOX_ARCH="x86_64"
+		else
+			BUSYBOX_ARCH="i686"
+		fi
+
+		if ! download "http://github.com/arcnmx/busybox-bin/releases/download/$BUSYBOX_VERSION/busybox-$BUSYBOX_ARCH" > "$WORKDIR/bin/busybox"; then
+			echo "Failed to download, trying fallback" >&2
+			download "http://busybox.net/downloads/binaries/busybox-$BUSYBOX_ARCH" > "$WORKDIR/bin/busybox"
+		fi
 	fi
 
-	mkdir -p "$WORKDIR/bin"
-
-	echo "Downloading busybox" >&2
-	download "http://busybox.net/downloads/binaries/busybox-$BUSYBOX_ARCH" > "$WORKDIR/bin/busybox"
 	chmod +x "$WORKDIR/bin/busybox"
 	"$WORKDIR/bin/busybox" --install "$WORKDIR/bin/"
-	export PATH="$WORKDIR/bin"
 
-	mkdir -p "$WORKDIR/mnt/root"
+	if [ -n "${PRE_SCRIPT-}" ]; then
+		if [ -x "$PRE_SCRIPT" ]; then
+			"$PRE_SCRIPT" "$WORKDIR"
+		else
+			/bin/sh "$PRE_SCRIPT" "$WORKDIR"
+		fi
+	fi
+
+	export PATH="$WORKDIR/bin"
 
 	cat "$POST_SCRIPT" > "$WORKDIR/tmp/hook-post"
 	chmod +x "$WORKDIR/tmp/hook-post"
@@ -93,37 +140,96 @@ cmd_bootstrap() {
 	prepare_root "$WORKDIR/"
 	cp "$SELF" "$WORKDIR/tmp/self.sh"
 
+	PATH=/bin ARGS="$*" /bin/sh -c export > "$WORKDIR/env"
+
+	cat > "$WORKDIR/init" <<EOF
+#!/bin/sh
+set -eu
+set -o pipefail
+exec > /dev/console < /dev/console 2>&1
+source /env
+
+if [ -n "\${SYSLOG_REMOTE-}" ]; then
+	syslogd -LR "\$SYSLOG_REMOTE" -O - -f /dev/null
+else
+	syslogd -LO - -f /dev/null
+fi
+
+/tmp/self.sh bootstrap_entry \$ARGS 2>&1 |
+	logger -s -t nuke
+EOF
+	chmod +x "$WORKDIR/init"
+
 	echo "Entering chroot" >&2
-	cd "$WORKDIR"
-	pivot_root . mnt/root
-	PATH=/bin exec chroot . /bin/sh /tmp/self.sh inner /mnt/root # < dev/null > dev/console 2>&1
+	if [ -n "$SYSTEMCTL" ]; then
+		# systemd
+		exec "$SYSTEMCTL" switch-root "$WORKDIR" /init
+	else
+		cd "$WORKDIR"
+		mkdir -p mnt/root
+		pivot_root . mnt/root
+		PATH=/bin exec chroot . /bin/sh /tmp/self.sh bootstrap_chroot /mnt/root < dev/console > dev/console 2>&1
+	fi
 }
 
-cmd_inner() {
+cmd_bootstrap_entry() {
+	echo "Done! Running post hook" >&2
+
+	exec /tmp/hook-post "$@"
+
+	#if [ -n "${ONCE_FILE-}" ]; then
+	#	touch "/mnt/root/$ONCE_FILE"
+	#fi
+}
+
+cmd_bootstrap_chroot() {
 	local ROOT="$1"
 	shift
 
-	echo "Unmounting filesystems" >&2
-	cat /proc/self/mounts | cut -d' ' -f 2 | sort -r | grep "^$ROOT" | while read -r mount; do
-		if [ "$mount" = "$ROOT" ]; then
-			continue
+	echo "Killing processes" >&2
+	trap '' 0 1 2 3 13 15
+
+	# loop until only us and init remain
+	for _cnt in $(seq 0 5); do
+		kill -TERM -1
+		echo "Waiting for dust to settle" >&2
+		sleep 1
+
+		COUNT=0
+		for PIDSTAT in /proc/*/stat; do
+			if [ -L "$(dirname "$PIDSTAT")" ]; then
+				continue
+			fi
+
+			PID=$(cut -d' ' -f1 "$PIDSTAT" || true)
+			PID_PARENT=$(cut -d' ' -f4 "$PIDSTAT" || true)
+			if [ -n "$PID" -a -n "$PID_PARENT" -a "$PID" -ne 1 -a "$PID" -ne "$$" -a "$PID_PARENT" -ne "$$" ]; then
+				COUNT=$((COUNT+1))
+			fi
+		done
+
+		if [ "$COUNT" -eq 0 ]; then
+			break
 		fi
+	done
+
+	echo "Unmounting filesystems" >&2
+
+	for fs in sys proc dev; do
+		umount -l "$ROOT/$fs" > /dev/null 2>&1 || true
+	done
+
+	cat /proc/self/mounts | cut -d' ' -f 2 | sort -r | grep "^$ROOT" | while read -r mount; do
+		#if [ "$mount" = "$ROOT" ]; then
+		#	continue
+		#fi
+
 		umount -rl "$mount"
 	done
 
-	for f in "$ROOT/"* "$ROOT/".[!.]*; do
-		if [ -e "$f" ]; then
-			rm -rf "$f"
-		fi
-	done
+	rmdir "$ROOT"
 
-	echo "Done! Running post hook" >&2
-
-	/tmp/hook-post "$ROOT"
-
-	if [ -n "${ONCE_FILE-}" ]; then
-		touch "/mnt/root/$ONCE_FILE"
-	fi
+	exec /init
 }
 
 prepare_root() {
@@ -131,27 +237,41 @@ prepare_root() {
 
 	mkdir -p "$ROOT/proc" "$ROOT/dev" "$ROOT/sys" "$ROOT/tmp"
 	mount -t proc proc "$ROOT/proc" || mount --rbind /proc "$ROOT/proc"
-	mount -t tmpfs dev "$ROOT/dev"
 	mount -t sysfs sys "$ROOT/sys" || true
 
-	mkdir -p "$ROOT/dev/pts" "$ROOT/dev/shm" "$ROOT/dev/mqueue"
-	mount -t tmpfs shm "$ROOT/dev/shm"
-	mount -t tmpfs mqueue "$ROOT/dev/mqueue"
-	#mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$ROOT/dev/pts"
+	if ! mount -t devtmpfs dev "$ROOT/dev"; then
+		mount -t tmpfs dev "$ROOT/dev"
 
-	echo "/dev/null c 1 3
+		echo "/dev/null c 1 3
 /dev/zero c 1 5
 /dev/full c 1 7
 /dev/random c 1 8
 /dev/urandom c 1 9
 /dev/tty c 5 0" | while read -r dev; do
-		if ! mknod "$ROOT"/$dev 2>/dev/null; then
-			local devname="$(echo $dev | cut -d' ' -f1)"
-			touch "$ROOT$devname"
-			mount --bind "$devname" "$ROOT$devname"
+			if ! mknod "$ROOT"/$dev 2>/dev/null; then
+				local devname="$(echo $dev | cut -d' ' -f1)"
+				touch "$ROOT$devname"
+				mount --bind "$devname" "$ROOT$devname"
+			fi
+		done
+	fi
+
+	if [ -e /dev/console ]; then
+		rm -f "$ROOT/dev/console"
+
+		KIND="$(stat /dev/console | grep -o 'Device type: .*' | cut -d' ' -f 3)"
+		MAJOR="$(echo $KIND | cut -d, -f 1)"
+		MINOR="$(echo $KIND | cut -d, -f 2)"
+		if ! mknod "$ROOT/dev/console" c $((0x$MAJOR)) $((0x$MINOR)) 2>/dev/null; then
+			touch "$ROOT/dev/console"
+			mount --bind /dev/console "$ROOT/dev/console"
 		fi
-	done
-	#cp "/dev/console" "$ROOT/console" || true
+	fi
+
+	mkdir -p "$ROOT/dev/pts" "$ROOT/dev/shm" "$ROOT/dev/mqueue"
+	mount -t tmpfs shm "$ROOT/dev/shm"
+	mount -t tmpfs mqueue "$ROOT/dev/mqueue"
+	#mount -t devpts -o newinstance,ptmxmode=0666,mode=0620 devpts "$ROOT/dev/pts"
 }
 
 download() {
