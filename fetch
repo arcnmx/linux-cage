@@ -1,0 +1,135 @@
+#!/bin/sh
+set -eu
+
+usage() {
+	echo "Usage: $0 [OPTIONS...] SUBCOMMAND"
+	echo " Fetches a remote file from storage"
+	echo " [-h]: show this help"
+	echo
+	echo "Subcommands"
+	echo "download [OPTIONS...] REMOTE_FILE"
+	echo " [-h]: show this help"
+	echo " [-o OUTPUT]: output file path"
+	echo
+	echo "Environment"
+	echo "FETCH_SERVICE: the remote service to fetch from"
+	echo "FETCH_AUTH_CERT: an SSL client cert to authenticate with"
+	echo "FETCH_AUTH_KEY: the key file associated with the client cert"
+}
+
+main() {
+	while getopts ":h" opt; do
+		case $opt in
+			h) # --help
+				usage
+				return 0
+				;;
+			:)
+				echo "Expected argument for option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+			\?)
+				echo "Invalid option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+
+	if [ $# -lt 1 ]; then
+		echo "Subcommand required" >&2
+		usage >&2
+		return 1
+	fi
+
+	local SUBCOMMAND="$1"
+	shift
+
+	"cmd_$SUBCOMMAND" "$@"
+}
+
+cmd_download() {
+	local OUTPUT_FILE=
+	while getopts ":ho:" opt; do
+		case $opt in
+			h) # --help
+				usage
+				return 0
+				;;
+			o) # --output OUTPUT_FILE
+				OUTPUT_FILE="$OPTARG"
+				;;
+			:)
+				echo "Expected argument for option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+			\?)
+				echo "Invalid option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+
+	if [ $# -lt 1 ]; then
+		echo "Filename required" >&2
+		usage >&2
+		return 1
+	fi
+
+	local FILE="$1"
+	shift
+
+	if [ -n "$OUTPUT_FILE" ]; then
+		exec > "$OUTPUT_FILE"
+	fi
+
+	if [ -z "${FETCH_SERVICE-}" ]; then
+		echo "FETCH_SERVICE must be set in the environment" >&2
+		usage >&2
+		return 1
+	fi
+
+	download_file "$FETCH_SERVICE/$FILE" |
+		if [ -n "${FETCH_CACHE_FILE-}" ]; then
+			tee "$FETCH_CACHE_FILE"
+		else
+			cat
+		fi
+}
+
+download_file() {
+	local URL="$1"
+	local UA="linux-cage/fetch 0.0.1"
+
+	if which curl > /dev/null 2>&1; then
+		if [ -n "${FETCH_AUTH_CERT-}" -a -n "${FETCH_AUTH_KEY-}" ]; then
+			curl -sSfL \
+				--cert "$FETCH_AUTH_CERT" --key "$FETCH_AUTH_KEY" \
+				-A "$UA curl" \
+				"$URL"
+		else
+			curl -sSfL \
+				-A "$UA curl" \
+				"$URL"
+		fi
+	elif which wget > /dev/null 2>&1; then
+		if [ -n "${FETCH_AUTH_CERT-}" -a -n "${FETCH_AUTH_KEY-}" ]; then
+			echo "WARNING: wget doesn't support SSL client certificates. Install curl." >&2
+			# GNU wget does, but considering that this may be busybox...
+		fi
+
+		wget -qO - \
+			-U "$UA wget" \
+			"$URL"
+	else
+		echo "Couldn't find suitable download tool. Install curl." >&2
+		return 1
+	fi
+}
+
+main "$@"
