@@ -1,22 +1,22 @@
-#!/bin/bash
+#!/bin/sh
 set -eu
 
-ARCH_MIRRORS="https://www.archlinux.org/mirrorlist/?country=all&protocol=https&ip_version=4&ip_version=6&use_mirror_status=on"
-ARCH_VERSION=2016.05.01
-ARCH_ARCH=x86_64
-ARCH_BASE=(bash bzip2 coreutils diffutils file filesystem findutils gawk gcc-libs glibc grep gzip inetutils iproute2 iputils less logrotate netctl perl procps-ng psmisc s-nail sed shadow tar util-linux which)
-ARCH_BASE_DEVEL=(autoconf automake binutils bison fakeroot flex gcc gettext groff gzip libtool m4 make patch pkg-config sed texinfo pacman git)
+ARCH_MIRRORS="http://www.archlinux.org/mirrorlist/?country=all&protocol=https&ip_version=4&ip_version=6&use_mirror_status=on"
+ARCH_VERSION=${ARCH_VERSION-2016.08.01}
+ARCH_ARCH=${ARCH_ARCH-x86_64}
+ARCH_BASE="bash bzip2 coreutils diffutils file filesystem findutils gawk gcc-libs glibc grep gzip inetutils iproute2 iputils less logrotate netctl perl procps-ng psmisc s-nail sed shadow tar util-linux which"
+ARCH_BASE_DEVEL="autoconf automake binutils bison fakeroot flex gcc gettext groff gzip libtool m4 make patch pkg-config sed texinfo pacman git"
 
-FLAG_PACKAGES=("${ARCH_BASE[@]}")
+FLAG_PACKAGES="$ARCH_BASE"
 FLAG_DEV=
 FLAG_BOOTSTRAP=
 while getopts ":p:b:d" opt; do
 	case $opt in
 		p) # --packages "openssh git"
-			FLAG_PACKAGES+=($OPTARG)
+			FLAG_PACKAGES="$FLAG_PACKAGES $OPTARG"
 			;;
 		d) # --base-devel
-			FLAG_PACKAGES+=("${ARCH_BASE_DEVEL[@]}")
+			FLAG_PACKAGES="$FLAG_PACKAGES $ARCH_BASE_DEVEL"
 			FLAG_DEV=y
 			;;
 		b) # --bootstrap ./arch-bootstrap
@@ -43,20 +43,21 @@ FLAG_OUT="$1"
 shift
 
 if [ -z "${ARCH_MIRROR-}" ]; then
-	ARCH_MIRROR=$(curl -fsSL "$ARCH_MIRRORS" | perl -pe 's/^#Server = //' | grep '^http' | shuf -n 1)
+	ARCH_MIRROR=$(curl -fsSL "$ARCH_MIRRORS" | sed 's/^#Server = //' | grep '^http' | shuf -n 1)
 fi
 ARCH_MIRROR_BASE=$(echo "$ARCH_MIRROR" | rev | cut -d / -f 4- | rev)
 ARCH_BOOTSTRAP="$ARCH_MIRROR_BASE/iso/$ARCH_VERSION/archlinux-bootstrap-$ARCH_VERSION-$ARCH_ARCH.tar.gz"
 
 mkdir -p "$FLAG_BOOTSTRAP"
-curl -fsSL "$ARCH_BOOTSTRAP" | tar -xz --strip-components 1 -C "$FLAG_BOOTSTRAP"
-cage exec -2 "$FLAG_BOOTSTRAP" pacman-key --init
-cage exec -2 "$FLAG_BOOTSTRAP" pacman-key --populate archlinux
+curl -fsSL "$ARCH_BOOTSTRAP" | tar -xz -C "$FLAG_BOOTSTRAP"
+BOOTSTRAP_ROOT="$FLAG_BOOTSTRAP/root.$ARCH_ARCH"
+cage exec -2 "$BOOTSTRAP_ROOT" pacman-key --init
+cage exec -2 "$BOOTSTRAP_ROOT" pacman-key --populate archlinux
 
-echo "Server = $ARCH_MIRROR" > "$FLAG_BOOTSTRAP/etc/pacman.d/mirrorlist"
+echo "Server = $ARCH_MIRROR" > "$BOOTSTRAP_ROOT/etc/pacman.d/mirrorlist"
 
 mkdir -p "$FLAG_OUT"
-cage exec -2b "$FLAG_OUT:/mnt/out" -e http_proxy "$FLAG_BOOTSTRAP" pacstrap -dc /mnt/out "${FLAG_PACKAGES[@]}" --noprogressbar
+cage exec -2b "$FLAG_OUT:/mnt/out" -e http_proxy "$BOOTSTRAP_ROOT" pacstrap -dc /mnt/out --noprogressbar $FLAG_PACKAGES
 
 if [ -n "$FLAG_DEV" ]; then
 	echo "PKGEXT=.pkg.tar" >> "$FLAG_OUT/etc/makepkg.conf"

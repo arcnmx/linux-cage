@@ -1,0 +1,113 @@
+#!/bin/bash
+set -eu
+
+NIX_ARCH=x86_64-linux
+NIX_VERSION=1.11.2
+NIXOS_VERSION=16.03
+BOOTSTRAP_URL="http://nixos.org/releases/nix/nix-${NIX_VERSION}/nix-${NIX_VERSION}-${NIX_ARCH}.tar.bz2"
+
+FLAG_PACKAGES=(a)
+while getopts ":p:" opt; do
+	case $opt in
+		p) # --packages "openssh git"
+			FLAG_PACKAGES+=($OPTARG)
+			;;
+		\?)
+			echo "Invalid option: -$OPTARG" >&2
+			exit 1
+			;;
+	esac
+done
+shift $((OPTIND-1))
+
+FLAG_OUT="$1"
+shift
+
+mkdir -p "$FLAG_OUT/nix"
+curl -fsSL "$BOOTSTRAP_URL" | tar -xj --strip-components 1 -C "$FLAG_OUT/nix"
+
+REGINFO="$FLAG_OUT/nix/.reginfo"
+NIX="$(grep -- "-nix-${NIX_VERSION}" "$REGINFO" | head -n1)"
+BASH="$(grep -- "-bash-" "$REGINFO" | head -n1)"
+COREUTILS="$(grep -- "-coreutils-" "$REGINFO" | head -n1)"
+CACERT="$(grep -- "-nss-cacert-" "$REGINFO" | head -n1)"
+
+mkdir -p "$FLAG_OUT/etc/nix" "$FLAG_OUT/bin" "$FLAG_OUT/var/setuid-wrappers"
+ln -sf "../$BASH/bin/bash" "$FLAG_OUT/bin/sh"
+cat > "$FLAG_OUT/etc/nix/nix.conf" <<EOF
+build-users-group =
+use-binary-caches = true
+binary-caches = http://cache.nixos.org
+EOF
+cat > "$FLAG_OUT/etc/hosts" <<EOF
+127.0.0.1 localhost.localdomain localhost
+::1 localhost.localdomain localhost
+EOF
+
+cage exec -2 "$FLAG_OUT" "$NIX/bin/nix-store" --init
+cage exec -2 "$FLAG_OUT" "$NIX/bin/nix-store" --load-db < "$REGINFO"
+cage exec -2  -e http_proxy -e PATH="$NIX/bin" "$FLAG_OUT" /bin/sh -s <<EOF
+	set -eu
+	. "$NIX/etc/profile.d/nix.sh"
+	#export SSL_CERT_FILE="$CACERT/etc/ssl/certs/ca-bundle.crt"
+	#nix-channel --add "https://nixos.org/channels/nixos-${NIXOS_VERSION}" nixos
+	nix-channel --add "http://nixos.org/channels/nixos-${NIXOS_VERSION}" nixos
+	nix-channel --add "http://nixos.org/channels/nixpkgs-unstable"
+	nix-channel --update
+EOF
+
+# https://gist.github.com/elitak/996e3b3c54c07409c8f2
+mkdir -p "$FLAG_OUT"
+cage exec -2 -e http_proxy -e PATH="$NIX/bin:$COREUTILS/bin" "$FLAG_OUT" /bin/sh -s "${FLAG_PACKAGES[@]}" <<EOF
+	set -eu
+	. "$NIX/etc/profile.d/nix.sh"
+	shift 1
+
+	mkdir -p /etc/nixos
+	cat > /etc/nixos/configuration.nix <<EOFI
+{ ... }: {
+	imports = [
+		./hardware-configuration.nix
+		./networking.nix
+	];
+
+	boot.cleanTmpDir = true;
+	#networking.hostName = "hostname";
+	networking.firewall.allowPing = true;
+	#services.openssh.enable = true;
+	#users.users.root.openssh.authorizedKeys.keys = [];
+}
+EOFI
+	cat > ./etc/nixos/hardware-configuration.nix <<EOFI
+{ ... }: {
+	imports = [ <nixpkgs/nixos/modules/profiles/qemu-guest.nix> ];
+	boot.loader.grub.enable = false;
+	fileSystems."/" = { device = "/dev/root"; };
+	#boot.loader.grub.devices = [ "/dev/vda" ];
+	#fileSystems."/" = { device = "/dev/vda1"; fsType = "ext4"; };
+}
+EOFI
+	cat > ./etc/nixos/networking.nix <<EOFI
+{ ... }: {
+}
+EOFI
+
+	export SSL_CERT_FILE="$CACERT/etc/ssl/certs/ca-bundle.crt"
+	NIXOS_CONFIG="/etc/nixos/configuration.nix"
+	nixpkgs="\$(readlink -f \$(nix-instantiate --find-file nixpkgs))"
+
+	NIX_PATH="nixpkgs=\$nixpkgs:nixos-config=\$NIXOS_CONFIG" NIXOS_CONFIG= \
+		nix-env \
+		-p /nix/var/nix/profiles/system -f '<nixpkgs/nixos>' --set -A system
+	touch "/etc/NIXOS"
+
+	nix-channel --remove nixpkgs-unstable
+	nix-channel --remove nixos
+	nix-channel --add "https://nixos.org/channels/nixos-${NIXOS_VERSION}" nixos
+	nix-channel --update
+
+	/nix/var/nix/profiles/system/bin/switch-to-configuration boot
+
+	mkdir -p /sbin
+	ln -sf ../nix/var/nix/profiles/system/init /sbin/init
+EOF

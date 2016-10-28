@@ -1,0 +1,103 @@
+#!/bin/sh
+set -eu
+
+usage() {
+	echo "Usage: $0 [OPTIONS...] PACKAGE_FILE..."
+	echo " Installs an Arch Linux .pkg file on potentially non-Arch systems"
+	echo " [-h]: show this help"
+	echo " [-f]: force reinstall"
+}
+
+main() {
+	OPT_REINSTALL=
+	while getopts ":hf" opt; do
+		case $opt in
+			h) # --help
+				usage
+				return 0
+				;;
+			f) # --force-reinstall
+				OPT_REINSTALL=y
+				;;
+			:)
+				echo "Expected argument for option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+			\?)
+				echo "Invalid option: -$OPTARG" >&2
+				usage >&2
+				return 1
+				;;
+		esac
+	done
+	shift $((OPTIND-1))
+
+	if [ $# -lt 1 ]; then
+		echo "Package file required" >&2
+		usage >&2
+		return 1
+	fi
+
+	install_pkgs "$@"
+}
+
+install_pkgs() {
+	local DISTRO_ID="$(
+		if [ -f /etc/os-release ]; then
+			. /etc/os-release
+		elif [ -f /usr/lib/os-release ]; then
+			. /usr/lib/os-release
+		fi
+		echo "$ID"
+	)"
+
+	if [ "$DISTRO_ID" = arch ]; then
+		local FLAGS=
+		if [ -z "$OPT_REINSTALL" ]; then
+			FLAGS=--needed
+		fi
+
+		pacman -U $FLAGS "$@"
+	else
+		for pkg in "$@"; do
+			install_pkg "$pkg"
+		done
+	fi
+}
+
+install_pkg() {
+	local PACKAGE="$1"
+
+	local STAGE="$(mktemp -d)"
+	for dir in boot etc lib lib64 opt sbin srv usr var; do
+		ln -sf /$dir "$STAGE/$dir"
+	done
+
+	(
+		um fuck this isnt bash
+		if [[ "$PACKAGE" = *.gz ]]; then
+			gzip -d
+		elif [[ "$PACKAGE" = *.xz ]]; then
+			xz -d
+		elif [[ "$PACKAGE" = *.tar ]]; then
+			cat
+		else
+			echo "Unrecognized file type" >&2
+			return 1
+		fi
+	) | tar -x -C "$STAGE"
+
+	if [ -f "$STAGE/.INSTALL" ]; then
+		(
+			. "$STAGE/.INSTALL"
+			if which post_install > /dev/null 2>&1; then
+				post_install || true
+			fi
+		)
+	fi
+
+	rm -rf "$STAGE"
+}
+
+main "$@"

@@ -1,11 +1,11 @@
-#!/bin/bash
+#!/bin/sh
 set -eu
 
-FLAG_PACKAGES=(alpine-base tzdata)
+FLAG_PACKAGES="alpine-base tzdata"
 while getopts ":p:" opt; do
 	case $opt in
 		p) # --packages "openssh git"
-			FLAG_PACKAGES+=($OPTARG)
+			FLAG_PACKAGES="$FLAG_PACKAGES $OPTARG"
 			;;
 		\?)
 			echo "Invalid option: -$OPTARG" >&2
@@ -38,7 +38,7 @@ APK_FLAGS=("$FLAG_OUT" /sbin/apk.static
 APK=("${CAGE[@]}" "${APK_FLAGS[@]}")
 "${APK[@]}" add --initdb
 
-"${APK[@]}" add "${FLAG_PACKAGES[@]}"
+"${APK[@]}" add $FLAG_PACKAGES
 if [ -f "$FLAG_OUT/bin/bbsuid" ]; then
 	chmod u+r "$FLAG_OUT/bin/bbsuid"
 fi

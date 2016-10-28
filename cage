@@ -26,6 +26,7 @@ usage() {
 	echo "Engines"
 	echo "nspawn: systemd-nspawn, requires root and systemd"
 	echo "unshare: included in util-linux"
+	echo "chroot: traditional chroot"
 	echo "encage: https://github.com/arcnmx/encage-runtime"
 }
 
@@ -59,14 +60,14 @@ main() {
 	local SUBCOMMAND="$1"
 	shift
 
-	"cmd-$SUBCOMMAND" "$@"
+	"cmd_$SUBCOMMAND" "$@"
 }
 
-cmd-exec() {
+cmd_exec() {
 	FLAG_ENGINE=${CAGE_ENGINE-}
 	FLAG_BINDS=()
 	FLAG_ENV=()
-	FLAG_PID=
+	FLAG_PID=3
 	FLAG_PIDFILE=
 	while getopts ":E:b:e:p:21h" opt; do
 		case $opt in
@@ -89,6 +90,9 @@ cmd-exec() {
 				;;
 			E) # --engine unshare
 				FLAG_ENGINE="$OPTARG"
+				;;
+			3)
+				FLAG_PID=3
 				;;
 			2)
 				FLAG_PID=2
@@ -122,8 +126,6 @@ cmd-exec() {
 	FLAG_ROOT="$1"
 	shift
 
-	ARGS=("$@")
-
 	if [ -z "$FLAG_ENGINE" ]; then
 		if [ "$(id -u)" = 0 ] && which systemd-nspawn >/dev/null 2>&1; then
 			FLAG_ENGINE=nspawn
@@ -131,19 +133,21 @@ cmd-exec() {
 			FLAG_ENGINE=unshare
 		elif which encage-run >/dev/null 2>&1; then
 			FLAG_ENGINE=encage
+		elif [ "$FLAG_PID" != 1 ]; then
+			FLAG_ENGINE=chroot
 		else
 			echo "Unable to autodetect container engine" >&2
 			return 1
 		fi
 	fi
 
-	"cmd-engine-$FLAG_ENGINE"
+	"cmd_engine_$FLAG_ENGINE" "$@"
 }
 
-cmd-engine-nspawn() {
-	FLAGS=(--link-journal=no --register false -D "$FLAG_ROOT")
+cmd_engine_nspawn() {
+	set -- --link-journal=no --register false -D "$FLAG_ROOT" "$@"
 	if [ "$FLAG_PID" != 1 ]; then
-		FLAGS+=(--as-pid2)
+		set -- --as-pid2 "$@"
 	fi
 
 	if [ "${#FLAG_BINDS[@]}" -gt 0 ]; then
@@ -151,13 +155,13 @@ cmd-engine-nspawn() {
 			if [[ ! $mount == /* ]]; then
 				mount="$PWD/$mount"
 			fi
-			FLAGS+=(--bind "$mount")
+			set -- --bind "$mount" "$@"
 		done
 	fi
 
 	if [ "${#FLAG_ENV[@]}" -gt 0 ]; then
 		for env in "${FLAG_ENV[@]}"; do
-			FLAGS+=(--setenv "$env")
+			set -- --setenv "$env" "$@"
 		done
 	fi
 
@@ -165,62 +169,68 @@ cmd-engine-nspawn() {
 		mkdir "$FLAG_ROOT/usr"
 	fi
 
-	exec systemd-nspawn "${FLAGS[@]}" "${ARGS[@]}"
+	if [ ! -s "$FLAG_ROOT/etc/machine-id" ]; then
+		set -- -M "cage-$$" "$@"
+	fi
+
+	exec systemd-nspawn "$@"
 }
 
-cmd-engine-encage() {
-	local FLAGS=(--direct)
+cmd_engine_encage() {
+	set -- --direct -- "$FLAG_ROOT" "$@"
 
 	if [ "$(id -u)" != 0 ]; then
-		FLAGS+=(--user --setgroups-deny)
+		set -- --user --setgroups-deny "$@"
 	fi
 
 	if [ "$FLAG_PID" = 2 ]; then
-		FLAGS+=(-2)
+		set -- -2 "$@"
 	fi
 
 	if [ "${#FLAG_BINDS[@]}" -gt 0 ]; then
 		for mount in "${FLAG_BINDS[@]}"; do
-			FLAGS+=(--bind "$mount")
+			set -- --bind "$mount" "$@"
 		done
 	fi
 
 	if [ "${#FLAG_ENV[@]}" -gt 0 ]; then
 		for env in "${FLAG_ENV[@]}"; do
-			FLAGS+=(--env "$env")
+			set -- --env "$env" "$@"
 		done
 	fi
 
-	exec encage-run exec "${FLAGS[@]:+${FLAGS[@]}}" -- "$FLAG_ROOT" "${ARGS[@]:+${ARGS[@]}}"
+	exec encage-run exec "$@"
 }
 
-cmd-engine-unshare() {
+cmd_engine_unshare() {
 	local UNSHARE_ARGS="-imu"
+
+	set -- "$FLAG_ROOT" "$@"
 
 	# Attempt to run in a user namespace if we're not root
 	if [ "$(id -u)" != 0 ]; then
 		UNSHARE_ARGS="${UNSHARE_ARGS}Ur"
-		if [ -z "$FLAG_PID" ]; then
+		if [ "$FLAG_PID" -gt 2 ]; then
 			FLAG_PID=2
 		fi
 	fi
 
 	# Old versions such as those found in Ubuntu 12.04 don't support PID namespaces...
-	if [ -n "$FLAG_PID" ]; then
+	if [ "$FLAG_PID" -lt 3 ]; then
 		UNSHARE_ARGS="${UNSHARE_ARGS}pf"
 	fi
 
-	FLAGS=()
 	if [ "${#FLAG_BINDS[@]}" -gt 0 ]; then
 		for mount in "${FLAG_BINDS[@]}"; do
-			FLAGS+=(-b "$mount")
+			set -- -b "$mount" "$@"
 		done
 	fi
 	if [ "${#FLAG_ENV[@]}" -gt 0 ]; then
 		for env in "${FLAG_ENV[@]}"; do
-			FLAGS+=(-e "$env")
+			set -- -e "$env" "$@"
 		done
 	fi
+
 	if [ "$FLAG_PID" = 2 ]; then
 		if ! which dumb-init >/dev/null 2>&1; then
 			DUMB_INIT=$(mktemp -d --tmpdir dumb-init.XXXXXXXXXX)
@@ -230,13 +240,20 @@ cmd-engine-unshare() {
 			#echo "PID 2 unimplemented, install dumb-init" >&2
 			#return 1
 		fi
-		exec unshare $UNSHARE_ARGS -- dumb-init "$SELF" internal-unshare "${FLAGS[@]:+${FLAGS[@]}}" "$FLAG_ROOT" "${ARGS[@]:+${ARGS[@]}}"
+		exec unshare $UNSHARE_ARGS -- dumb-init "$SELF" internal-unshare "$@"
 	else
-		exec unshare $UNSHARE_ARGS -- "$SELF" internal-unshare "${FLAGS[@]:+${FLAGS[@]}}" "$FLAG_ROOT" "${ARGS[@]:+${ARGS[@]}}"
+		exec unshare $UNSHARE_ARGS -- "$SELF" internal-unshare "$@"
 	fi
 }
 
-cmd-internal-unshare() {
+cmd_engine_chroot() {
+	echo unimplemented >&2
+	return 1
+}
+
+cmd_internal_unshare() {
+	set -- "$FLAG_ROOT" "$@"
+
 	FLAG_BINDS=()
 	while getopts ":b:e:" opt; do
 		case $opt in
@@ -291,7 +308,7 @@ cmd-internal-unshare() {
 		done
 	fi
 
-	exec env -i PATH=/bin:/sbin:/usr/bin:/usr/sbin "${FLAG_ENV[@]:+${FLAG_ENV[@]}}" chroot "$FLAG_ROOT" "$@"
+	exec env -i PATH=/bin:/sbin:/usr/bin:/usr/sbin "${FLAG_ENV[@]:+${FLAG_ENV[@]}}" chroot "$@"
 }
 
 SELF="$0"
